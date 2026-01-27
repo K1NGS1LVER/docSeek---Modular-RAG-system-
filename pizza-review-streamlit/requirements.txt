@@ -1,0 +1,3 @@
+langchain
+langchian-ollama
+langchain-chroma
