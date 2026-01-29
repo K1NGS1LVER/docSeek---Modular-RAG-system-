@@ -63,3 +63,11 @@ def get_document_count() -> int:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM documents")
         return cursor.fetchone()[0]
+
+def get_all_metadata() -> List[str]:
+    """Get metadata for all documents to identify unique files"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT metadata FROM documents WHERE metadata IS NOT NULL")
+        rows = cursor.fetchall()
+    return [row[0] for row in rows]

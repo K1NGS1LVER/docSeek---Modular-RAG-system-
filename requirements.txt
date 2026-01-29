@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+sentence-transformers
+faiss-cpu
+numpy
+requests
+beautifulsoup4
+python-multipart

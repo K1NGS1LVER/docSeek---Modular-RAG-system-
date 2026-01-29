@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Send, FileText, Upload, Trash2, Bot, User, RotateCcw } from 'lucide-react';
+import { Send, FileText, Upload, Trash2, Bot, User, RotateCcw, Github, AlertCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const API_URL = "/api";
@@ -12,6 +12,10 @@ const Dashboard = () => {
     const [files, setFiles] = useState([]);
     const [isUploading, setIsUploading] = useState(false);
     const [isSearching, setIsSearching] = useState(false);
+    const [showGithubForm, setShowGithubForm] = useState(false);
+    const [githubUrl, setGithubUrl] = useState('');
+    const [githubSubpath, setGithubSubpath] = useState('');
+    const [ingestStatus, setIngestStatus] = useState({ is_ingesting: false, message: '', progress: 0, total: 0, error: null });
     const chatEndRef = useRef(null);
 
     const fetchDocuments = async () => {
@@ -26,9 +30,36 @@ const Dashboard = () => {
         }
     };
 
+    const fetchStatus = async () => {
+        try {
+            const res = await fetch(`${API_URL}/ingest/status`);
+            if (res.ok) {
+                const status = await res.json();
+                setIngestStatus(status);
+                
+                // If finished or error, refresh documents one last time
+                if (!status.is_ingesting && (status.progress > 0 || status.error)) {
+                     fetchDocuments();
+                }
+            }
+        } catch (error) {
+            console.error("Failed to fetch status", error);
+        }
+    };
+
     useEffect(() => {
         fetchDocuments();
+        fetchStatus();
     }, []);
+
+    // Poll for status when ingesting
+    useEffect(() => {
+        let interval;
+        if (ingestStatus.is_ingesting) {
+            interval = setInterval(fetchStatus, 1000);
+        }
+        return () => clearInterval(interval);
+    }, [ingestStatus.is_ingesting]);
 
     const scrollToBottom = () => {
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -37,6 +68,36 @@ const Dashboard = () => {
     useEffect(() => {
         scrollToBottom();
     }, [messages]);
+
+    const handleGithubSubmit = async (e) => {
+        e.preventDefault();
+        if (!githubUrl) return;
+
+        setShowGithubForm(false);
+        setIngestStatus(prev => ({ ...prev, is_ingesting: true, message: "Starting..." }));
+        
+        try {
+            const res = await fetch(`${API_URL}/ingest/github`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url: githubUrl, subpath: githubSubpath })
+            });
+            
+            if (res.ok) {
+                 setMessages(prev => [...prev, { role: 'assistant', content: `🚀 Started ingesting ${githubUrl}.\nCheck the sidebar for progress.` }]);
+            } else {
+                 const err = await res.json();
+                 throw new Error(err.detail || "Failed to start ingestion");
+            }
+        } catch (error) {
+            alert(error.message);
+            setIngestStatus(prev => ({ ...prev, is_ingesting: false }));
+        } finally {
+            setGithubUrl('');
+            setGithubSubpath('');
+        }
+    };
+
 
     const handleSend = async (e) => {
         e.preventDefault();
@@ -122,11 +183,79 @@ const Dashboard = () => {
                         <FileText className="w-5 h-5 text-primary" />
                         Documents
                     </h2>
-                    <label className={`p-2 hover:bg-white/10 rounded-lg transition-colors cursor-pointer ${isUploading ? 'opacity-50 pointer-events-none' : ''}`}>
-                        <Upload className="w-4 h-4" />
-                        <input type="file" className="hidden" multiple onChange={handleFileUpload} disabled={isUploading} />
-                    </label>
+                    <div className="flex items-center gap-2">
+                        <button 
+                            onClick={() => setShowGithubForm(!showGithubForm)}
+                            className={`p-2 hover:bg-white/10 rounded-lg transition-colors text-slate-400 hover:text-white ${showGithubForm ? 'bg-white/10 text-white' : ''}`}
+                            title="Ingest from GitHub"
+                        >
+                            <Github className="w-4 h-4" />
+                        </button>
+                        <label className={`p-2 hover:bg-white/10 rounded-lg transition-colors cursor-pointer text-slate-400 hover:text-white ${isUploading ? 'opacity-50 pointer-events-none' : ''}`} title="Upload files">
+                            <Upload className="w-4 h-4" />
+                            <input type="file" className="hidden" multiple onChange={handleFileUpload} disabled={isUploading} />
+                        </label>
+                    </div>
                 </div>
+
+                <AnimatePresence>
+                    {showGithubForm && (
+                        <motion.form 
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            onSubmit={handleGithubSubmit} 
+                            className="mb-4 overflow-hidden"
+                        >
+                            <div className="p-3 bg-white/5 rounded-xl border border-white/10 space-y-2">
+                                <input 
+                                    type="text" 
+                                    placeholder="GitHub Repo URL" 
+                                    className="w-full bg-black/20 border border-white/10 rounded-lg px-2 py-2 text-xs text-white placeholder:text-slate-500 focus:outline-none focus:border-primary/50"
+                                    value={githubUrl}
+                                    onChange={e => setGithubUrl(e.target.value)}
+                                    required
+                                />
+                                <input 
+                                    type="text" 
+                                    placeholder="Subpath (e.g., docs/)" 
+                                    className="w-full bg-black/20 border border-white/10 rounded-lg px-2 py-2 text-xs text-white placeholder:text-slate-500 focus:outline-none focus:border-primary/50"
+                                    value={githubSubpath}
+                                    onChange={e => setGithubSubpath(e.target.value)}
+                                />
+                                <button type="submit" className="w-full bg-primary hover:bg-primary/90 text-white text-xs font-medium py-2 rounded-lg transition-colors">
+                                    Start Ingestion
+                                </button>
+                            </div>
+                        </motion.form>
+                    )}
+                </AnimatePresence>
+
+                {ingestStatus.is_ingesting && (
+                    <div className="mb-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-xl">
+                        <div className="flex justify-between text-xs text-blue-300 mb-1">
+                            <span>{ingestStatus.message}</span>
+                            {ingestStatus.total > 0 && <span>{Math.round((ingestStatus.progress / ingestStatus.total) * 100)}%</span>}
+                        </div>
+                        <div className="h-1.5 bg-blue-500/20 rounded-full overflow-hidden">
+                            <motion.div 
+                                className="h-full bg-blue-500" 
+                                initial={{ width: 0 }}
+                                animate={{ width: `${ingestStatus.total > 0 ? (ingestStatus.progress / ingestStatus.total) * 100 : 0}%` }}
+                            />
+                        </div>
+                    </div>
+                )}
+
+                {ingestStatus.error && !ingestStatus.is_ingesting && (
+                     <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-xl flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+                        <div className="text-xs text-red-300">
+                            <p className="font-semibold">Ingestion Failed</p>
+                            <p>{ingestStatus.error}</p>
+                        </div>
+                    </div>
+                )}
 
                 <div className="flex-1 overflow-y-auto space-y-3">
                     {files.length === 0 && (

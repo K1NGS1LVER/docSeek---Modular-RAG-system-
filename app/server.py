@@ -1,12 +1,80 @@
 import os
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+import logging
+from datetime import datetime
+from typing import List, Optional, Dict
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import shutil
 
 from app.core.config import MODEL_NAME, EMBEDDING_DIM, HOST, PORT, DB_PATH, INDEX_PATH
-from app.core import database
+from app.core import database, parsing
 from app.core.engine import VectorEngine
+from app.ingest import ingest_github
+
+# ============================================================================
+# LOGGING & STATE
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# Simple in-memory state for the latest ingestion job
+ingest_status = {
+    "is_ingesting": False,
+    "current_file": "",
+    "progress": 0,
+    "total": 0,
+    "message": "Idle",
+    "error": None,
+    "history": []
+}
+
+def update_status(message: str, current: int = 0, total: int = 0, error: str = None, is_ingesting: bool = True):
+    ingest_status["message"] = message
+    ingest_status["progress"] = current
+    ingest_status["total"] = total
+    ingest_status["is_ingesting"] = is_ingesting
+    if error:
+        ingest_status["error"] = error
+        ingest_status["is_ingesting"] = False
+    
+    # Log important updates
+    if error:
+        logger.error(f"Ingest Error: {error}")
+    elif message:
+        logger.info(f"Ingest Status: {message} ({current}/{total})")
+
+def run_ingest_background(repo_url: str, subpath: str, pattern: str):
+    """
+    Wrapper to run ingestion with status updates.
+    """
+    try:
+        update_status(f"Starting clone of {repo_url}...", is_ingesting=True)
+        
+        # Define a callback to receive updates from ingest.py
+        def progress_callback(msg, current, total, error=None):
+            update_status(msg, current, total, error, is_ingesting=True)
+            
+        ingest_github(
+            repo_url=repo_url, 
+            subpath=subpath, 
+            pattern=pattern, 
+            callback=progress_callback
+        )
+        
+        update_status("Ingestion complete", ingest_status["progress"], ingest_status["total"], is_ingesting=False)
+        ingest_status["history"].append(f"Success: {repo_url} at {datetime.now()}")
+        
+    except Exception as e:
+        logger.exception("Background ingestion failed")
+        update_status("Failed", error=str(e), is_ingesting=False)
+        ingest_status["history"].append(f"Failed: {repo_url} - {str(e)}")
 
 # ============================================================================
 # PYDANTIC MODELS
@@ -15,6 +83,11 @@ from app.core.engine import VectorEngine
 class IngestRequest(BaseModel):
     text: str
     metadata: Optional[str] = None
+
+class GithubIngestRequest(BaseModel):
+    url: str
+    subpath: Optional[str] = ""
+    pattern: Optional[str] = "**/*.md"
 
 class SearchRequest(BaseModel):
     query: str
@@ -32,6 +105,15 @@ class SearchResult(BaseModel):
 
 app = FastAPI(title="RAG Search System", version="1.0.0")
 
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify the frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Global engine instance
 engine: Optional[VectorEngine] = None
 
@@ -41,7 +123,7 @@ def startup():
     global engine
     database.init_db()
     engine = VectorEngine()
-    print(
+    logger.info(
         f"System ready. Documents in DB: {database.get_document_count()}, Vectors in FAISS: {engine.get_total_vectors()}"
     )
 
@@ -50,13 +132,14 @@ def shutdown():
     """Save index on shutdown"""
     if engine:
         engine.save()
+        logger.info("Index saved.")
 
 @app.post("/ingest")
 def ingest_document(request: IngestRequest):
     """
-    Ingest a document into the system.
-    Returns the document ID.
+    Ingest a raw text document.
     """
+    logger.info("Received manual text ingestion request")
     # 1. Generate embedding
     vector = engine.embed(request.text)
 
@@ -72,11 +155,93 @@ def ingest_document(request: IngestRequest):
         "message": f"Document indexed with ID {doc_id}",
     }
 
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    Upload and ingest a file.
+    """
+    filename = file.filename
+    logger.info(f"Received upload request: {filename}")
+    content_bytes = await file.read()
+    
+    try:
+        content_str = content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Could not decode file as UTF-8. Only text files are currently supported.")
+
+    # Parse based on extension
+    if filename.endswith(".md"):
+        content_str = parsing.parse_markdown(content_str)
+    elif filename.endswith(".html"):
+        content_str = parsing.parse_html(content_str)
+    
+    content_str = parsing.clean_text(content_str)
+    
+    if not content_str:
+        return {"status": "skipped", "message": "File is empty"}
+
+    chunks = parsing.chunk_text(content_str)
+    
+    count = 0
+    for i, chunk in enumerate(chunks):
+        metadata = f"{filename}#chunk{i+1}"
+        vector = engine.embed(chunk)
+        database.insert_document(chunk, metadata)
+        engine.add_to_index(vector)
+        count += 1
+
+    logger.info(f"Processed {filename}: {count} chunks")
+    return {
+        "status": "success",
+        "chunks_ingested": count,
+        "filename": filename
+    }
+
+@app.post("/ingest/github")
+def ingest_github_repo(request: GithubIngestRequest, background_tasks: BackgroundTasks):
+    """
+    Ingest a GitHub repository in the background.
+    """
+    if ingest_status["is_ingesting"]:
+        raise HTTPException(status_code=400, detail="An ingestion job is already running")
+
+    background_tasks.add_task(
+        run_ingest_background, 
+        repo_url=request.url, 
+        subpath=request.subpath, 
+        pattern=request.pattern
+    )
+    return {"status": "started", "message": f"Cloning and ingesting {request.url} in the background..."}
+
+@app.get("/ingest/status")
+def get_ingest_status():
+    """Get the status of the current/last ingestion job"""
+    return ingest_status
+
+@app.get("/documents")
+def list_documents():
+    """
+    List all unique documents in the system.
+    """
+    all_metadata = database.get_all_metadata()
+    files = {}
+    
+    for m in all_metadata:
+        if not m: 
+            continue
+        # Metadata format: filename#chunkN
+        name = m.split('#')[0]
+        files[name] = files.get(name, 0) + 1
+        
+    return [
+        {"name": name, "chunks": count, "status": "indexed"}
+        for name, count in files.items()
+    ]
+
 @app.post("/search", response_model=List[SearchResult])
 def search(request: SearchRequest):
     """
     Search for documents similar to the query.
-    Returns top-k results with scores.
     """
     if engine.get_total_vectors() == 0:
         return []
