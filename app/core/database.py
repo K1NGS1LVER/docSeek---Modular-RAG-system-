@@ -71,3 +71,11 @@ def get_all_metadata() -> List[str]:
         cursor.execute("SELECT metadata FROM documents WHERE metadata IS NOT NULL")
         rows = cursor.fetchall()
     return [row[0] for row in rows]
+
+def get_all_documents() -> List[Dict[str, Any]]:
+    """Fetch all documents (for index rebuilding)"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, content, metadata FROM documents")
+        rows = cursor.fetchall()
+    return [{"id": row[0], "content": row[1], "metadata": row[2]} for row in rows]

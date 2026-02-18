@@ -1,5 +1,5 @@
 import re
-from typing import List
+from typing import List, Tuple
 from bs4 import BeautifulSoup
 
 CHUNK_SIZE = 300  # Characters per chunk
@@ -7,22 +7,24 @@ CHUNK_OVERLAP = 50  # Overlap between chunks
 
 def chunk_text(
     text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
-) -> List[str]:
+) -> List[Tuple[str, int, int]]:
     """
-    Split text into overlapping chunks.
+    Split text into overlapping chunks with character positions.
+    Returns list of (chunk_text, start_char, end_char) tuples.
     This prevents context loss at chunk boundaries.
     """
     if not text:
         return []
         
     if len(text) <= chunk_size:
-        return [text]
+        return [(text, 0, len(text))]
 
     chunks = []
     start = 0
 
     while start < len(text):
         end = min(start + chunk_size, len(text))
+        original_end = end
 
         # Try to break at sentence boundary
         if end < len(text):
@@ -37,7 +39,10 @@ def chunk_text(
             
         chunk = text[start:end].strip()
         if chunk:
-            chunks.append(chunk)
+            # Find actual positions after stripping
+            chunk_start = text.find(chunk, start)
+            chunk_end = chunk_start + len(chunk)
+            chunks.append((chunk, chunk_start, chunk_end))
 
         next_start = end - overlap
         if next_start <= start:

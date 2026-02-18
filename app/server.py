@@ -1,22 +1,38 @@
-import os
+import json
 import logging
-from datetime import datetime
-from typing import List, Optional, Dict
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import os
+import threading
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
+
 import uvicorn
-import shutil
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
-from app.core.config import MODEL_NAME, EMBEDDING_DIM, HOST, PORT, DB_PATH, INDEX_PATH
 from app.core import database, parsing
+from app.core.config import (
+    DB_PATH,
+    EMBEDDING_DIM,
+    HOST,
+    INDEX_PATH,
+    MODEL_NAME,
+    PORT,
+    UPLOAD_DIR,
+)
 from app.core.engine import VectorEngine
-from app.ingest import ingest_github
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+
+try:
+    from docx import Document
+
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
 
 # ============================================================================
-# LOGGING & STATE
+# LOGGING
 # ============================================================================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -24,267 +40,804 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Simple in-memory state for the latest ingestion job
-ingest_status = {
-    "is_ingesting": False,
-    "current_file": "",
-    "progress": 0,
-    "total": 0,
-    "message": "Idle",
-    "error": None,
-    "history": []
-}
+if not DOCX_AVAILABLE:
+    logger.warning("python-docx not available. .docx files will not be supported.")
 
-def update_status(message: str, current: int = 0, total: int = 0, error: str = None, is_ingesting: bool = True):
-    ingest_status["message"] = message
-    ingest_status["progress"] = current
-    ingest_status["total"] = total
-    ingest_status["is_ingesting"] = is_ingesting
-    if error:
-        ingest_status["error"] = error
-        ingest_status["is_ingesting"] = False
-    
-    # Log important updates
-    if error:
-        logger.error(f"Ingest Error: {error}")
-    elif message:
-        logger.info(f"Ingest Status: {message} ({current}/{total})")
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
-def run_ingest_background(repo_url: str, subpath: str, pattern: str):
-    """
-    Wrapper to run ingestion with status updates.
-    """
-    try:
-        update_status(f"Starting clone of {repo_url}...", is_ingesting=True)
-        
-        # Define a callback to receive updates from ingest.py
-        def progress_callback(msg, current, total, error=None):
-            update_status(msg, current, total, error, is_ingesting=True)
-            
-        ingest_github(
-            repo_url=repo_url, 
-            subpath=subpath, 
-            pattern=pattern, 
-            callback=progress_callback
+
+def extract_text_from_docx(file_path: str) -> str:
+    """Extract text from a .docx file"""
+    if not DOCX_AVAILABLE:
+        raise HTTPException(
+            status_code=400,
+            detail="Word document support not available. Install python-docx.",
         )
-        
-        update_status("Ingestion complete", ingest_status["progress"], ingest_status["total"], is_ingesting=False)
-        ingest_status["history"].append(f"Success: {repo_url} at {datetime.now()}")
-        
+
+    try:
+        doc = Document(file_path)
+        paragraphs = [
+            paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip()
+        ]
+        return "\n\n".join(paragraphs)
     except Exception as e:
-        logger.exception("Background ingestion failed")
-        update_status("Failed", error=str(e), is_ingesting=False)
-        ingest_status["history"].append(f"Failed: {repo_url} - {str(e)}")
+        raise HTTPException(
+            status_code=400, detail=f"Failed to read Word document: {str(e)}"
+        )
+
 
 # ============================================================================
 # PYDANTIC MODELS
 # ============================================================================
 
+
 class IngestRequest(BaseModel):
     text: str
     metadata: Optional[str] = None
 
-class GithubIngestRequest(BaseModel):
-    url: str
-    subpath: Optional[str] = ""
-    pattern: Optional[str] = "**/*.md"
 
 class SearchRequest(BaseModel):
     query: str
     k: int = 5
 
+
 class SearchResult(BaseModel):
     id: int
     score: float
     content: str
-    metadata: Optional[str]
+    source: Optional[Dict[str, Any]] = None
+
+
+class DocumentViewResponse(BaseModel):
+    file: str
+    content: str
+    highlight: Optional[Dict[str, int]] = None
+
+
+class GitHubIngestRequest(BaseModel):
+    repo_url: str
+    subpath: Optional[str] = None
+
 
 # ============================================================================
-# FASTAPI APPLICATION
+# LIFECYCLE
 # ============================================================================
 
-app = FastAPI(title="RAG Search System", version="1.0.0")
+engine: Optional[VectorEngine] = None
 
-# Enable CORS
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global engine
+    database.init_db()
+    engine = VectorEngine()
+
+    # Auto-rebuild index if DB has documents but FAISS is empty
+    db_count = database.get_document_count()
+    faiss_count = engine.get_total_vectors()
+    if db_count > 0 and faiss_count == 0:
+        logger.info(
+            f"Index is empty but DB has {db_count} documents. Rebuilding index..."
+        )
+        _rebuild_index()
+
+    logger.info(
+        f"System ready. Documents in DB: {database.get_document_count()}, "
+        f"Vectors in FAISS: {engine.get_total_vectors()}"
+    )
+    yield
+    # Shutdown
+    if engine:
+        engine.save()
+        logger.info("Index saved.")
+
+
+def _rebuild_index():
+    """Rebuild FAISS index from all documents in the database"""
+    global engine
+    import faiss
+
+    from app.core.config import EMBEDDING_DIM
+
+    all_docs = database.get_all_documents()
+    if not all_docs:
+        logger.info("No documents to rebuild index from.")
+        return 0
+
+    # Create a fresh index
+    base_index = faiss.IndexFlatIP(EMBEDDING_DIM)
+    engine.index = faiss.IndexIDMap(base_index)
+
+    # Batch embed all document contents
+    texts = [doc["content"] for doc in all_docs]
+    doc_ids = [doc["id"] for doc in all_docs]
+
+    batch_size = 64
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i : i + batch_size]
+        batch_ids = doc_ids[i : i + batch_size]
+        embeddings = engine.embed_batch(batch_texts)
+        engine.add_to_index(embeddings, doc_ids=batch_ids)
+
+    engine.save()
+    logger.info(f"\u2705 Index rebuilt with {len(all_docs)} documents.")
+    return len(all_docs)
+
+
+# ============================================================================
+# FASTAPI APP
+# ============================================================================
+
+app = FastAPI(title="RAG Search System", version="1.0.0", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify the frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global engine instance
-engine: Optional[VectorEngine] = None
+# ============================================================================
+# INGEST & SEARCH
+# ============================================================================
 
-@app.on_event("startup")
-def startup():
-    """Initialize resources on startup"""
-    global engine
-    database.init_db()
-    engine = VectorEngine()
-    logger.info(
-        f"System ready. Documents in DB: {database.get_document_count()}, Vectors in FAISS: {engine.get_total_vectors()}"
-    )
-
-@app.on_event("shutdown")
-def shutdown():
-    """Save index on shutdown"""
-    if engine:
-        engine.save()
-        logger.info("Index saved.")
-
-@app.post("/ingest")
-def ingest_document(request: IngestRequest):
-    """
-    Ingest a raw text document.
-    """
-    logger.info("Received manual text ingestion request")
-    # 1. Generate embedding
-    vector = engine.embed(request.text)
-
-    # 2. Save to SQLite (get ID)
-    doc_id = database.insert_document(request.text, request.metadata)
-
-    # 3. Add to FAISS
-    engine.add_to_index(vector)
-
-    return {
-        "status": "success",
-        "id": doc_id,
-        "message": f"Document indexed with ID {doc_id}",
-    }
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """
-    Upload and ingest a file.
-    """
-    filename = file.filename
-    logger.info(f"Received upload request: {filename}")
-    content_bytes = await file.read()
-    
+    """Upload and ingest a single document file (optimized with batch embedding)"""
+    import time
+
+    start_time = time.time()
+
     try:
-        content_str = content_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="Could not decode file as UTF-8. Only text files are currently supported.")
+        # Save the uploaded file
+        file_path = UPLOAD_DIR / file.filename
+        content = await file.read()
 
-    # Parse based on extension
-    if filename.endswith(".md"):
-        content_str = parsing.parse_markdown(content_str)
-    elif filename.endswith(".html"):
-        content_str = parsing.parse_html(content_str)
-    
-    content_str = parsing.clean_text(content_str)
-    
-    if not content_str:
-        return {"status": "skipped", "message": "File is empty"}
+        with open(file_path, "wb") as f:
+            f.write(content)
 
-    chunks = parsing.chunk_text(content_str)
-    
-    count = 0
-    for i, chunk in enumerate(chunks):
-        metadata = f"{filename}#chunk{i+1}"
-        vector = engine.embed(chunk)
-        database.insert_document(chunk, metadata)
-        engine.add_to_index(vector)
-        count += 1
+        # Parse based on file extension
+        ext = os.path.splitext(file.filename)[1].lower()
 
-    logger.info(f"Processed {filename}: {count} chunks")
+        # Validate file type
+        supported_extensions = [".txt", ".md", ".markdown", ".html", ".htm", ".docx"]
+        if ext not in supported_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {ext}. Supported: {', '.join(supported_extensions)}",
+            )
+
+        # Extract text based on file type
+        try:
+            if ext == ".docx":
+                # For .docx files, we need to extract from the saved file
+                text_content = extract_text_from_docx(str(file_path))
+            elif ext in [".txt", ".md", ".markdown"]:
+                text_content = content.decode("utf-8", errors="replace")
+                if ext in [".md", ".markdown"]:
+                    text_content = parsing.parse_markdown(text_content)
+            elif ext in [".html", ".htm"]:
+                text_content = content.decode("utf-8", errors="replace")
+                text_content = parsing.parse_html(text_content)
+            else:
+                text_content = content.decode("utf-8", errors="replace")
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"Failed to extract text from file: {str(e)}"
+            )
+
+        # Chunk the content (returns tuples of (text, start_char, end_char))
+        chunks = parsing.chunk_text(text_content)
+
+        if not chunks:
+            raise HTTPException(
+                status_code=400, detail="No content could be extracted from file"
+            )
+
+        logger.info(f"Processing {file.filename}: {len(chunks)} chunks to embed...")
+
+        # BATCH EMBED all chunks at once (MUCH faster than one-by-one)
+        chunk_texts = [chunk_text for chunk_text, _, _ in chunks]
+
+        embed_start = time.time()
+        embeddings = engine.embed_batch(chunk_texts)
+        embed_time = time.time() - embed_start
+        logger.info(
+            f"✅ Embedded {len(chunks)} chunks in {embed_time:.2f}s ({len(chunks) / embed_time:.0f} chunks/sec)"
+        )
+
+        # Insert all chunks with their embeddings
+        doc_ids = []
+        for i, ((chunk_text, start_char, end_char), embedding) in enumerate(
+            zip(chunks, embeddings)
+        ):
+            metadata = json.dumps(
+                {
+                    "source_file": str(file_path),
+                    "chunk_index": i,
+                    "total_chunks": len(chunks),
+                    "filename": file.filename,
+                    "start_char": start_char,
+                    "end_char": end_char,
+                }
+            )
+
+            doc_id = database.insert_document(chunk_text, metadata)
+            doc_ids.append(doc_id)
+
+        # Add all embeddings to index with their actual DB IDs
+        engine.add_to_index(embeddings, doc_ids=doc_ids)
+
+        elapsed = time.time() - start_time
+        logger.info(
+            f"✅ Successfully ingested {file.filename} ({len(chunks)} chunks) in {elapsed:.2f}s"
+        )
+
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "chunks": len(chunks),
+            "doc_ids": doc_ids,
+            "time_seconds": round(elapsed, 2),
+        }
+
+    except Exception as e:
+        logger.error(f"Error uploading file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/upload-multiple")
+async def upload_multiple_files(files: list[UploadFile] = File(...)):
+    """Upload and ingest multiple documents at once (optimized batch processing)"""
+    import time
+
+    start_time = time.time()
+
+    results = []
+    total_chunks = 0
+
+    for file in files:
+        try:
+            # Save the uploaded file
+            file_path = UPLOAD_DIR / file.filename
+            content = await file.read()
+
+            with open(file_path, "wb") as f:
+                f.write(content)
+
+            # Parse based on file extension
+            ext = os.path.splitext(file.filename)[1].lower()
+
+            # Validate file type
+            supported_extensions = [
+                ".txt",
+                ".md",
+                ".markdown",
+                ".html",
+                ".htm",
+                ".docx",
+            ]
+            if ext not in supported_extensions:
+                results.append(
+                    {
+                        "filename": file.filename,
+                        "status": "failed",
+                        "error": f"Unsupported file type: {ext}",
+                    }
+                )
+                continue
+
+            # Extract text based on file type
+            try:
+                if ext == ".docx":
+                    text_content = extract_text_from_docx(str(file_path))
+                elif ext in [".txt", ".md", ".markdown"]:
+                    text_content = content.decode("utf-8", errors="replace")
+                    if ext in [".md", ".markdown"]:
+                        text_content = parsing.parse_markdown(text_content)
+                elif ext in [".html", ".htm"]:
+                    text_content = content.decode("utf-8", errors="replace")
+                    text_content = parsing.parse_html(text_content)
+                else:
+                    text_content = content.decode("utf-8", errors="replace")
+            except Exception as decode_error:
+                results.append(
+                    {
+                        "filename": file.filename,
+                        "status": "failed",
+                        "error": f"Failed to decode: {str(decode_error)}",
+                    }
+                )
+                continue
+
+            # Chunk the content
+            chunks = parsing.chunk_text(text_content)
+
+            if not chunks:
+                results.append(
+                    {
+                        "filename": file.filename,
+                        "status": "failed",
+                        "error": "No content could be extracted",
+                    }
+                )
+                continue
+
+            # Batch embed all chunks for this file
+            chunk_texts = [chunk_text for chunk_text, _, _ in chunks]
+            embeddings = engine.embed_batch(chunk_texts)
+
+            # Insert all chunks with their embeddings
+            doc_ids = []
+            for i, ((chunk_text, start_char, end_char), embedding) in enumerate(
+                zip(chunks, embeddings)
+            ):
+                metadata = json.dumps(
+                    {
+                        "source_file": str(file_path),
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                        "filename": file.filename,
+                        "start_char": start_char,
+                        "end_char": end_char,
+                    }
+                )
+
+                doc_id = database.insert_document(chunk_text, metadata)
+                doc_ids.append(doc_id)
+
+            # Add all embeddings to index with their actual DB IDs
+            engine.add_to_index(embeddings, doc_ids=doc_ids)
+
+            total_chunks += len(chunks)
+            results.append(
+                {"filename": file.filename, "status": "success", "chunks": len(chunks)}
+            )
+
+            logger.info(f"✅ Processed {file.filename} ({len(chunks)} chunks)")
+
+        except Exception as e:
+            logger.error(f"Error processing {file.filename}: {str(e)}")
+            results.append(
+                {"filename": file.filename, "status": "failed", "error": str(e)}
+            )
+
+    elapsed = time.time() - start_time
+    logger.info(
+        f"✅ Batch upload complete: {len(files)} files, {total_chunks} total chunks in {elapsed:.2f}s"
+    )
+
     return {
-        "status": "success",
-        "chunks_ingested": count,
-        "filename": filename
+        "status": "complete",
+        "files_processed": len(files),
+        "total_chunks": total_chunks,
+        "time_seconds": round(elapsed, 2),
+        "results": results,
     }
 
-@app.post("/ingest/github")
-def ingest_github_repo(request: GithubIngestRequest, background_tasks: BackgroundTasks):
-    """
-    Ingest a GitHub repository in the background.
-    """
-    if ingest_status["is_ingesting"]:
-        raise HTTPException(status_code=400, detail="An ingestion job is already running")
 
-    background_tasks.add_task(
-        run_ingest_background, 
-        repo_url=request.url, 
-        subpath=request.subpath, 
-        pattern=request.pattern
-    )
-    return {"status": "started", "message": f"Cloning and ingesting {request.url} in the background..."}
+@app.post("/ingest")
+def ingest_document(request: IngestRequest):
+    vector = engine.embed(request.text)
+    doc_id = database.insert_document(request.text, request.metadata)
+    engine.add_to_index(vector, doc_ids=[doc_id])
+    return {"status": "success", "id": doc_id}
 
-@app.get("/ingest/status")
-def get_ingest_status():
-    """Get the status of the current/last ingestion job"""
-    return ingest_status
 
-@app.get("/documents")
-def list_documents():
-    """
-    List all unique documents in the system.
-    """
-    all_metadata = database.get_all_metadata()
-    files = {}
-    
-    for m in all_metadata:
-        if not m: 
-            continue
-        # Metadata format: filename#chunkN
-        name = m.split('#')[0]
-        files[name] = files.get(name, 0) + 1
-        
-    return [
-        {"name": name, "chunks": count, "status": "indexed"}
-        for name, count in files.items()
-    ]
+SIMILARITY_THRESHOLD = 0.20  # Minimum cosine similarity score to return a result
+
 
 @app.post("/search", response_model=List[SearchResult])
 def search(request: SearchRequest):
-    """
-    Search for documents similar to the query.
-    """
     if engine.get_total_vectors() == 0:
         return []
 
-    # 1. Vectorize query
     query_vector = engine.embed(request.query)
-
-    # 2. Search FAISS for top-k indices
     top_indices, scores = engine.search(query_vector, request.k)
 
-    # 3. Fetch documents from SQLite
-    # Convert FAISS indices to SQLite IDs (1-indexed)
-    valid_ids = [int(idx) + 1 for idx in top_indices if idx != -1]
+    logger.info(
+        f"Search '{request.query}' → top scores: {[f'{s:.4f}' for s in scores]}"
+    )
 
+    # top_indices now contains actual DB IDs (from IndexIDMap)
+    valid_ids = [int(idx) for idx in top_indices if idx != -1]
     if not valid_ids:
         return []
 
     documents = database.fetch_documents_by_ids(valid_ids)
-
-    # 4. Combine scores with documents
     doc_map = {doc["id"]: doc for doc in documents}
 
     results = []
     for idx, score in zip(top_indices, scores):
         if idx == -1:
             continue
-        doc_id = int(idx) + 1
-        if doc_id in doc_map:
-            doc = doc_map[doc_id]
-            results.append(
-                SearchResult(
-                    id=doc["id"],
-                    score=float(score),
-                    content=doc["content"],
-                    metadata=doc["metadata"],
-                )
+
+        # Skip results below the similarity threshold
+        if float(score) < SIMILARITY_THRESHOLD:
+            continue
+
+        doc_id = int(idx)
+        if doc_id not in doc_map:
+            continue
+
+        doc = doc_map[doc_id]
+        source_data = None
+
+        if doc.get("metadata"):
+            try:
+                source_data = json.loads(doc["metadata"])
+            except Exception:
+                source_data = {"raw": doc["metadata"]}
+
+        results.append(
+            SearchResult(
+                id=doc["id"],
+                score=float(score),
+                content=doc["content"],
+                source=source_data,
             )
+        )
 
     return results
 
+
+# ============================================================================
+# DOCUMENT VIEW
+# ============================================================================
+
+
+@app.get("/document/view", response_class=HTMLResponse)
+def view_document(
+    file: str = Query(...),
+    start: Optional[int] = Query(None),
+    end: Optional[int] = Query(None),
+):
+    """View document content with optional highlighting"""
+    if not os.path.exists(file):
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    ext = os.path.splitext(file)[1].lower()
+    filename = os.path.basename(file)
+
+    try:
+        # Handle .docx files
+        if ext == ".docx":
+            content = extract_text_from_docx(file)
+        else:
+            # Handle text-based files
+            with open(file, "r", encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+
+            if ext in [".md", ".markdown"]:
+                content = parsing.parse_markdown(raw)
+            elif ext in [".html", ".htm"]:
+                content = parsing.parse_html(raw)
+            else:
+                content = raw
+    except UnicodeDecodeError:
+        # Try with different encoding if UTF-8 fails
+        try:
+            with open(file, "r", encoding="latin-1") as f:
+                raw = f.read()
+            content = raw
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Cannot decode file: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # If start and end are provided, highlight that section
+    highlighted_html = ""
+    if (
+        start is not None
+        and end is not None
+        and start < len(content)
+        and end <= len(content)
+    ):
+        before = content[:start]
+        highlighted = content[start:end]
+        after = content[end:]
+
+        # Escape HTML
+        import html as html_module
+
+        before = html_module.escape(before)
+        highlighted = html_module.escape(highlighted)
+        after = html_module.escape(after)
+
+        content_html = f"{before}<mark style='background: #ffd700; padding: 2px 4px;'>{highlighted}</mark>{after}"
+    else:
+        import html as html_module
+
+        content_html = html_module.escape(content)
+
+    # Create a nice HTML page
+    html_response = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{filename}</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                max-width: 900px;
+                margin: 40px auto;
+                padding: 20px;
+                line-height: 1.6;
+                background: #1a1a2e;
+                color: #e0e0e0;
+            }}
+            h1 {{
+                color: #4a9eff;
+                border-bottom: 2px solid #4a9eff;
+                padding-bottom: 10px;
+            }}
+            pre {{
+                background: #0f0f1e;
+                padding: 15px;
+                border-radius: 8px;
+                overflow-x: auto;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                border: 1px solid #2a2a3e;
+            }}
+            mark {{
+                background: #ffd700;
+                color: #000;
+                padding: 2px 4px;
+                border-radius: 3px;
+            }}
+            .header {{
+                background: #0f0f1e;
+                padding: 15px;
+                border-radius: 8px;
+                margin-bottom: 20px;
+                border: 1px solid #2a2a3e;
+            }}
+            .info {{
+                color: #888;
+                font-size: 14px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>📄 {filename}</h1>
+            <div class="info">
+                {f"Showing characters {start} to {end}" if start is not None else "Full document"}
+            </div>
+        </div>
+        <pre>{content_html}</pre>
+    </body>
+    </html>
+    """
+
+    return html_response
+
+
+# ============================================================================
+# FRONTEND COMPATIBILITY ENDPOINTS
+# ============================================================================
+
+# GitHub ingestion status (shared state)
+github_ingest_status = {
+    "is_ingesting": False,
+    "current_file": "",
+    "progress": 0,
+    "total": 0,
+    "message": "Idle",
+    "error": None,
+}
+
+
+def _github_ingest_worker(repo_url: str, subpath: Optional[str]):
+    """Background worker to clone and ingest a GitHub repo"""
+    import re as re_module
+    import subprocess
+    import tempfile
+
+    global github_ingest_status
+    github_ingest_status = {
+        "is_ingesting": True,
+        "current_file": "",
+        "progress": 0,
+        "total": 0,
+        "message": f"Cloning {repo_url}...",
+        "error": None,
+    }
+
+    try:
+        # Clone the repo into a temp directory
+        tmpdir = tempfile.mkdtemp(prefix="docseek_github_")
+        logger.info(f"Cloning {repo_url} into {tmpdir}")
+
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", repo_url, tmpdir],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise Exception(f"Git clone failed: {result.stderr.strip()}")
+
+        # Determine the scan directory
+        scan_dir = os.path.join(tmpdir, subpath) if subpath else tmpdir
+        if not os.path.isdir(scan_dir):
+            raise Exception(f"Subpath '{subpath}' not found in the repository.")
+
+        # Find supported files
+        supported_exts = {".md", ".markdown", ".txt", ".html", ".htm", ".rst"}
+        files_to_ingest = []
+        for root, dirs, files in os.walk(scan_dir):
+            # Skip hidden dirs and common non-doc dirs
+            dirs[:] = [
+                d
+                for d in dirs
+                if not d.startswith(".")
+                and d not in ("node_modules", "__pycache__", ".git", "venv", ".venv")
+            ]
+            for f in files:
+                if os.path.splitext(f)[1].lower() in supported_exts:
+                    files_to_ingest.append(os.path.join(root, f))
+
+        if not files_to_ingest:
+            raise Exception("No supported files found in the repository.")
+
+        github_ingest_status["total"] = len(files_to_ingest)
+        github_ingest_status["message"] = (
+            f"Found {len(files_to_ingest)} files. Ingesting..."
+        )
+        logger.info(f"Found {len(files_to_ingest)} files to ingest from {repo_url}")
+
+        total_chunks = 0
+        for idx, filepath in enumerate(files_to_ingest):
+            filename = os.path.relpath(filepath, tmpdir)
+            github_ingest_status["current_file"] = filename
+            github_ingest_status["progress"] = idx + 1
+            github_ingest_status["message"] = (
+                f"Processing {filename} ({idx + 1}/{len(files_to_ingest)})"
+            )
+
+            try:
+                ext = os.path.splitext(filepath)[1].lower()
+                with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                    raw = fh.read()
+
+                if ext in [".md", ".markdown"]:
+                    text_content = parsing.parse_markdown(raw)
+                elif ext in [".html", ".htm"]:
+                    text_content = parsing.parse_html(raw)
+                else:
+                    text_content = raw
+
+                text_content = re_module.sub(r"\n{3,}", "\n\n", text_content).strip()
+                if not text_content:
+                    continue
+
+                chunks = parsing.chunk_text(text_content)
+                if not chunks:
+                    continue
+
+                chunk_texts = [ct for ct, _, _ in chunks]
+                embeddings = engine.embed_batch(chunk_texts)
+
+                doc_ids = []
+                for i, ((chunk_text, start_char, end_char), embedding) in enumerate(
+                    zip(chunks, embeddings)
+                ):
+                    metadata = json.dumps(
+                        {
+                            "source_file": filepath,
+                            "chunk_index": i,
+                            "total_chunks": len(chunks),
+                            "filename": filename,
+                            "start_char": start_char,
+                            "end_char": end_char,
+                            "github_repo": repo_url,
+                        }
+                    )
+                    doc_id = database.insert_document(chunk_text, metadata)
+                    doc_ids.append(doc_id)
+
+                engine.add_to_index(embeddings, doc_ids=doc_ids)
+                total_chunks += len(chunks)
+
+            except Exception as file_err:
+                logger.error(f"Error processing {filename}: {file_err}")
+
+        engine.save()
+
+        github_ingest_status["is_ingesting"] = False
+        github_ingest_status["message"] = (
+            f"Done! Ingested {len(files_to_ingest)} files ({total_chunks} chunks)"
+        )
+        logger.info(
+            f"✅ GitHub ingestion complete: {len(files_to_ingest)} files, {total_chunks} chunks"
+        )
+
+        # Cleanup temp directory
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    except Exception as e:
+        logger.error(f"GitHub ingestion failed: {e}")
+        github_ingest_status["is_ingesting"] = False
+        github_ingest_status["error"] = str(e)
+        github_ingest_status["message"] = f"Failed: {str(e)}"
+
+
+@app.post("/ingest/github")
+def ingest_github(request: GitHubIngestRequest):
+    """Start ingesting documentation from a GitHub repository"""
+    if github_ingest_status["is_ingesting"]:
+        raise HTTPException(
+            status_code=409, detail="An ingestion is already in progress"
+        )
+
+    # Validate the URL
+    if not request.repo_url.startswith(
+        ("https://github.com/", "https://gitlab.com/", "http")
+    ):
+        raise HTTPException(
+            status_code=400, detail="Please provide a valid Git repository URL"
+        )
+
+    # Start ingestion in background thread
+    thread = threading.Thread(
+        target=_github_ingest_worker,
+        args=(request.repo_url, request.subpath),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"status": "started", "message": f"Ingesting from {request.repo_url}"}
+
+
+@app.get("/documents")
+def list_documents():
+    """Return list of uploaded document filenames"""
+    all_metadata = database.get_all_metadata()
+    files = set()
+
+    for m in all_metadata:
+        if not m:
+            continue
+        try:
+            meta_obj = json.loads(m)
+            if "filename" in meta_obj:
+                files.add(meta_obj["filename"])
+        except Exception:
+            # Legacy format - just extract filename if it's part of metadata
+            pass
+
+    return list(files)
+
+
+@app.get("/ingest/status")
+def get_ingest_status():
+    return {
+        "is_ingesting": github_ingest_status["is_ingesting"],
+        "current_file": github_ingest_status.get("current_file", ""),
+        "progress": github_ingest_status.get("progress", 0),
+        "total": github_ingest_status.get("total", 0),
+        "message": github_ingest_status.get("message", "Idle"),
+        "error": github_ingest_status.get("error", None),
+        "history": [],
+    }
+
+
+# ============================================================================
+# SYSTEM
+# ============================================================================
+
+
 @app.get("/stats")
 def get_stats():
-    """Get system statistics"""
     return {
         "total_documents": database.get_document_count(),
         "total_vectors": engine.get_total_vectors(),
@@ -293,24 +846,32 @@ def get_stats():
         "index_type": "IndexFlatIP (Cosine Similarity)",
     }
 
+
 @app.delete("/reset")
 def reset_system():
-    """WARNING: Deletes all data and resets the system"""
     global engine
 
-    # Delete database
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
-
-    # Delete index
     if os.path.exists(INDEX_PATH):
         os.remove(INDEX_PATH)
 
-    # Reinitialize
     database.init_db()
     engine = VectorEngine()
 
     return {"status": "System reset successfully"}
+
+
+@app.post("/rebuild")
+def rebuild_index():
+    """Rebuild the FAISS index from all documents in the database"""
+    count = _rebuild_index()
+    return {"status": "success", "documents_indexed": count}
+
+
+# ============================================================================
+# ENTRY
+# ============================================================================
 
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT)

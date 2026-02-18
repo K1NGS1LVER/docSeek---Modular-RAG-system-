@@ -7,6 +7,8 @@ DATA_DIR = BASE_DIR / "data"
 
 # Ensure data directory exists
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR = DATA_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # File Paths
 DB_PATH = str(DATA_DIR / "docs.db")
