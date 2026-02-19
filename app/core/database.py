@@ -79,3 +79,12 @@ def get_all_documents() -> List[Dict[str, Any]]:
         cursor.execute("SELECT id, content, metadata FROM documents")
         rows = cursor.fetchall()
     return [{"id": row[0], "content": row[1], "metadata": row[2]} for row in rows]
+
+def reset_db():
+    """Clear all documents from the database"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM documents")
+        cursor.execute("DELETE FROM sqlite_sequence WHERE name='documents'")
+        conn.commit()
+

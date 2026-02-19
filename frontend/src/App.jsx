@@ -1,20 +1,26 @@
-import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
-import Navbar from './components/Navbar';
-import Landing from './pages/Landing';
-import Dashboard from './pages/Dashboard';
+import { useState, useEffect } from 'react'
+import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import LandingPage from './pages/LandingPage'
+import AppPage from './pages/AppPage'
+import './App.css'
 
-function App() {
+export default function App() {
+  const [theme, setTheme] = useState(() => {
+    return localStorage.getItem('ds_theme') || 'dark'
+  })
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('ds_theme', theme)
+  }, [theme])
+
   return (
-    <Router>
-      <div className="min-h-screen bg-dark text-white selection:bg-primary selection:text-white">
-        <Navbar />
-        <Routes>
-          <Route path="/" element={<Landing />} />
-          <Route path="/dashboard" element={<Dashboard />} />
-        </Routes>
-      </div>
-    </Router>
-  );
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<LandingPage theme={theme} setTheme={setTheme} />} />
+        <Route path="/app" element={<AppPage theme={theme} setTheme={setTheme} />} />
+      </Routes>
+    </BrowserRouter>
+  )
 }
 
-export default App;

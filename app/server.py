@@ -429,6 +429,33 @@ def ingest_document(request: IngestRequest):
     return {"status": "success", "id": doc_id}
 
 
+@app.get("/stats")
+def get_stats():
+    """Get index statistics"""
+    return {
+        "total_documents": database.get_document_count(),
+        "total_vectors": engine.get_total_vectors(),
+        "model": MODEL_NAME,
+        "dimension": EMBEDDING_DIM,
+    }
+
+
+@app.delete("/reset")
+def reset_index():
+    """Reset the database and index"""
+    global engine
+    
+    # Clear database
+    database.reset_db()
+    
+    # Clear FAISS index
+    engine = VectorEngine()
+    engine.save()
+    
+    logger.info("🗑️ System reset: Database and Index cleared.")
+    return {"status": "success", "message": "Index and database reset"}
+
+
 SIMILARITY_THRESHOLD = 0.20  # Minimum cosine similarity score to return a result
 
 
