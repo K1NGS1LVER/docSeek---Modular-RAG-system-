@@ -8,3 +8,5 @@ requests
 beautifulsoup4
 python-multipart
 python-docx
+openai
+sse-starlette

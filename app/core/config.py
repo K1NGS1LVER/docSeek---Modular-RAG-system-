@@ -28,3 +28,9 @@ PORT = 8000
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# LLM Settings (Ollama)
+LLM_BASE_URL = "http://localhost:11434/v1"
+LLM_MODEL = "mistral"
+LLM_TEMPERATURE = 0.3
+LLM_MAX_TOKENS = 1024

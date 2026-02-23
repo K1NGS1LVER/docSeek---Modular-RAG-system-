@@ -95,6 +95,62 @@ export async function search(query, k = 5) {
   });
 }
 
+/**
+ * Ask the LLM a question using RAG (streaming SSE response).
+ * @param {string} query - The user's question
+ * @param {number} k - Number of chunks to retrieve
+ * @param {function} onChunk - Callback called with each text chunk as it arrives
+ * @returns {Promise<string>} The full accumulated response
+ */
+export async function ask(query, k = 3, onChunk) {
+  const url = `${BASE}/ask`;
+  const start = performance.now();
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, k }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(body || `HTTP ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let accumulated = '';
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const rawData = line.slice(6);
+        try {
+          const chunkStr = JSON.parse(rawData);
+          accumulated += chunkStr;
+          if (onChunk) onChunk(accumulated);
+        } catch (e) {
+          // Fallback if not JSON (e.g. from an old server version)
+          accumulated += rawData;
+          if (onChunk) onChunk(accumulated);
+        }
+      }
+    }
+  }
+
+  const latency = Math.round(performance.now() - start);
+  return { data: accumulated, latency };
+}
+
 /* ── Index Management ────────────────────────────────── */
 
 export async function rebuildIndex() {

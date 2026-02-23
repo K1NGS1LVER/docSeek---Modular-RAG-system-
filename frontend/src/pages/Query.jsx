@@ -11,9 +11,12 @@ import {
   Eye,
   EyeOff,
   Hash,
+  MessageSquare,
+  Search,
 } from 'lucide-react';
-import { search, getDocumentViewUrl } from '../lib/api';
+import { search, ask, getDocumentViewUrl } from '../lib/api';
 import { useSystem } from '../lib/SystemContext';
+import ReactMarkdown from 'react-markdown';
 
 /* ── Score bar ─────────────────────────────────────── */
 function ScoreBar({ score }) {
@@ -86,7 +89,6 @@ function ChunkCard({ result, index, showRaw }) {
   );
 }
 
-/* ================================================================== */
 export default function Query() {
   const { stats, addLog } = useSystem();
   const [messages, setMessages] = useState([]);
@@ -94,6 +96,7 @@ export default function Query() {
   const [isSearching, setIsSearching] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
   const [topK, setTopK] = useState(5);
+  const [mode, setMode] = useState('ask');
   const endRef = useRef(null);
 
   useEffect(() => {
@@ -105,6 +108,14 @@ export default function Query() {
     if (!input.trim() || isSearching) return;
 
     const query = input.trim();
+    if (mode === 'ask') {
+      await handleAsk(query);
+    } else {
+      await performSearch(query);
+    }
+  };
+
+  const performSearch = async (query) => {
     setMessages((prev) => [...prev, { type: 'query', text: query, ts: Date.now() }]);
     setInput('');
     setIsSearching(true);
@@ -128,6 +139,48 @@ export default function Query() {
     }
   };
 
+  const handleAsk = async (query) => {
+    setMessages((prev) => [...prev, { type: 'query', text: query, ts: Date.now() }]);
+    setInput('');
+    setIsSearching(true);
+    addLog(`Ask AI: "${query}" (k=${topK})`);
+
+    // Insert an empty answer placeholder
+    setMessages((prev) => [
+      ...prev,
+      { type: 'answer', text: '', isStreaming: true, ts: Date.now() }
+    ]);
+
+    try {
+      const { data, latency } = await ask(query, topK, (chunk) => {
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          // Update the streaming chunk
+          updated[lastIdx] = { ...updated[lastIdx], text: chunk, isStreaming: true };
+          return updated;
+        });
+      });
+      
+      // Mark as done
+      setMessages((prev) => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          updated[lastIdx] = { ...updated[lastIdx], text: data, isStreaming: false, latency };
+          return updated;
+      });
+      addLog(`Answered in ${latency}ms`);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        { type: 'error', text: err.message, ts: Date.now() },
+      ]);
+      addLog(`Ask error: ${err.message}`, 'ERROR');
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full">
       {/* Controls bar */}
@@ -137,10 +190,34 @@ export default function Query() {
           Query Engine
         </span>
         <div className="w-px h-4 bg-border" />
-        <span className="text-[10px] font-mono text-text-muted">
+        <span className="text-[10px] font-mono text-text-muted hidden md:inline">
           {stats?.total_vectors ?? 0} vectors searchable
         </span>
         <div className="flex-1" />
+
+        {/* Mode toggle */}
+        <div className="flex items-center bg-carbon border border-border p-0.5 rounded-sm shrink-0">
+          <button
+            onClick={() => setMode('ask')}
+            className={`flex items-center gap-1.5 px-3 py-1 text-[10px] font-mono transition-colors ${
+              mode === 'ask' ? 'bg-accent/20 text-accent' : 'text-text-muted hover:text-text-dim'
+            }`}
+          >
+            <MessageSquare className="w-3 h-3" />
+            <span className="hidden sm:inline">ASK AI</span>
+          </button>
+          <button
+            onClick={() => setMode('search')}
+            className={`flex items-center gap-1.5 px-3 py-1 text-[10px] font-mono transition-colors ${
+              mode === 'search' ? 'bg-accent/20 text-accent' : 'text-text-muted hover:text-text-dim'
+            }`}
+          >
+            <Search className="w-3 h-3" />
+            <span className="hidden sm:inline">SEARCH</span>
+          </button>
+        </div>
+
+        <div className="w-px h-4 bg-border hidden sm:block" />
 
         {/* Top K selector */}
         <div className="flex items-center gap-2">
@@ -232,6 +309,30 @@ export default function Query() {
                     ))}
                   </div>
                 )}
+              </motion.div>
+            );
+          }
+
+          if (msg.type === 'answer') {
+            return (
+              <motion.div
+                key={idx}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="space-y-3"
+              >
+                <div className="flex items-center gap-3 text-[10px] font-mono text-text-muted">
+                  <span className="text-accent">~</span>
+                  <span>AI Assistant {msg.latency ? `(${msg.latency}ms)` : ''}</span>
+                </div>
+                <div className="bg-carbon border border-border p-4">
+                    <div className="prose prose-invert prose-sm max-w-none text-text-dim font-mono leading-relaxed prose-pre:bg-panel prose-pre:border prose-pre:border-border prose-a:text-accent">
+                      <ReactMarkdown>{msg.text || "Thinking..."}</ReactMarkdown>
+                      {msg.isStreaming && (
+                        <span className="inline-block w-2 h-4 bg-accent animate-pulse ml-1 align-middle" />
+                      )}
+                    </div>
+                </div>
               </motion.div>
             );
           }

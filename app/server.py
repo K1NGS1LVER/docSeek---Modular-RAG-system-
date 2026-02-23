@@ -8,12 +8,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 import uvicorn
 
 from app.core.config import MODEL_NAME, EMBEDDING_DIM, HOST, PORT, DB_PATH, INDEX_PATH, UPLOAD_DIR
 from app.core import database, parsing
 from app.core.engine import VectorEngine
+from app.core.llm import OllamaLLM
 
 try:
     from docx import Document
@@ -89,13 +91,15 @@ class GitHubIngestRequest(BaseModel):
 # ============================================================================
 
 engine: Optional[VectorEngine] = None
+llm: Optional[OllamaLLM] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global engine
+    global engine, llm
     database.init_db()
     engine = VectorEngine()
+    llm = OllamaLLM()
     
     # Auto-rebuild index if DB has documents but FAISS is empty
     db_count = database.get_document_count()
@@ -428,6 +432,79 @@ def search(request: SearchRequest):
         )
 
     return results
+
+# ============================================================================
+# ASK (LLM-POWERED RAG)
+# ============================================================================
+
+class AskRequest(BaseModel):
+    query: str
+    k: int = 3
+
+@app.post("/ask")
+async def ask(request: AskRequest):
+    """RAG endpoint: retrieve context from vector DB, then stream an LLM answer."""
+
+    try:
+        # 1. Retrieve relevant chunks (reuse search logic)
+        if engine.get_total_vectors() == 0:
+            async def empty_stream():
+                yield {"data": "No documents have been uploaded yet. Please upload some documents first."}
+            return EventSourceResponse(empty_stream())
+
+        query_vector = engine.embed(request.query)
+        top_indices, scores = engine.search(query_vector, request.k)
+
+        valid_ids = [int(idx) for idx in top_indices if idx != -1]
+        documents = database.fetch_documents_by_ids(valid_ids) if valid_ids else []
+        doc_map = {doc["id"]: doc for doc in documents}
+
+        # Build search results for LLM context
+        search_results = []
+        for idx, score in zip(top_indices, scores):
+            if idx == -1 or float(score) < SIMILARITY_THRESHOLD:
+                continue
+            doc_id = int(idx)
+            if doc_id not in doc_map:
+                continue
+            doc = doc_map[doc_id]
+            source_data = None
+            if doc.get("metadata"):
+                try:
+                    source_data = json.loads(doc["metadata"])
+                except Exception:
+                    source_data = {"raw": doc["metadata"]}
+            search_results.append({
+                "content": doc["content"],
+                "score": float(score),
+                "source": source_data,
+            })
+
+        if not search_results:
+            async def no_results_stream():
+                yield {"data": "I couldn't find any relevant information in the uploaded documents for your query."}
+            return EventSourceResponse(no_results_stream())
+
+        # 2. Build context and stream LLM response
+        context = llm.build_context(search_results)
+
+        logger.info(f"ASK '{request.query}' → {len(search_results)} chunks, streaming LLM response...")
+
+        async def llm_stream():
+            try:
+                for chunk in llm.stream_answer(request.query, context):
+                    yield {"data": json.dumps(chunk)}
+            except Exception as stream_err:
+                logger.error(f"LLM streaming error: {stream_err}")
+                yield {"data": json.dumps(f"\n\n⚠️ Error during LLM response: {str(stream_err)}")}
+
+        return EventSourceResponse(llm_stream())
+
+    except Exception as e:
+        logger.error(f"ASK endpoint error: {e}")
+        async def error_stream():
+            yield {"data": f"⚠️ Server error: {str(e)}"}
+        return EventSourceResponse(error_stream())
 
 # ============================================================================
 # DOCUMENT VIEW

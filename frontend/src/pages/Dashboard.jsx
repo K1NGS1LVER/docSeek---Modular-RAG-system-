@@ -8,9 +8,12 @@ import {
   RotateCcw,
   Github,
   AlertCircle,
-  ExternalLink
+  ExternalLink,
+  Search,
+  MessageSquare
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import ReactMarkdown from 'react-markdown';
 
 const API_URL = "/api";
 
@@ -26,6 +29,7 @@ const Dashboard = () => {
   const [files, setFiles] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
+  const [mode, setMode] = useState('ask'); // 'ask' (default) or 'search'
   const [showGithubForm, setShowGithubForm] = useState(false);
   const [githubUrl, setGithubUrl] = useState('');
   const [githubSubpath, setGithubSubpath] = useState('');
@@ -90,10 +94,99 @@ const Dashboard = () => {
   useEffect(scrollToBottom, [messages]);
 
   /* ------------------------------------------------------------------
-   * SEARCH HANDLER (🔴 THIS IS WHERE WE CHANGED LOGIC)
+   * ASK HANDLER (LLM-POWERED STREAMING)
    * ------------------------------------------------------------------ */
 
-  const handleSend = async (e) => {
+  const handleAsk = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const query = input;
+    setMessages(prev => [...prev, { role: 'user', content: query }]);
+    setInput('');
+    setIsSearching(true);
+
+    // Add an empty assistant message that we'll stream into
+    const assistantIdx = messages.length + 1; // +1 for the user message we just added
+    setMessages(prev => [...prev, { role: 'assistant', content: '', isStreaming: true }]);
+
+    try {
+      const res = await fetch(`${API_URL}/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, k: 3 })
+      });
+
+      if (!res.ok) {
+        throw new Error(`Server error: ${res.status}`);
+      }
+
+      // Read the SSE stream
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulated = '';
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events from buffer
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            accumulated += data;
+
+            // Update the last assistant message with accumulated text
+            setMessages(prev => {
+              const updated = [...prev];
+              updated[updated.length - 1] = {
+                role: 'assistant',
+                content: accumulated,
+                isStreaming: true
+              };
+              return updated;
+            });
+          }
+        }
+      }
+
+      // Mark streaming as complete
+      setMessages(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          role: 'assistant',
+          content: accumulated || "No response received from the LLM.",
+          isStreaming: false
+        };
+        return updated;
+      });
+
+    } catch (error) {
+      setMessages(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          role: 'assistant',
+          content: `Error: ${error.message}. Is the server and Ollama running?`,
+          isStreaming: false
+        };
+        return updated;
+      });
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  /* ------------------------------------------------------------------
+   * SEARCH HANDLER (ORIGINAL — UNCHANGED)
+   * ------------------------------------------------------------------ */
+
+  const handleSearch = async (e) => {
     e.preventDefault();
     if (!input.trim()) return;
 
@@ -125,7 +218,7 @@ const Dashboard = () => {
           ...prev,
           {
             role: 'assistant',
-            content: "Here’s what I found:",
+            content: "Here's what I found:",
             results
           }
         ]);
@@ -201,6 +294,18 @@ const Dashboard = () => {
     setMessages([
       { role: 'assistant', content: 'System reset. All documents cleared.' }
     ]);
+  };
+
+  /* ------------------------------------------------------------------
+   * FORM SUBMIT — routes to ask or search based on mode
+   * ------------------------------------------------------------------ */
+
+  const handleSubmit = (e) => {
+    if (mode === 'ask') {
+      handleAsk(e);
+    } else {
+      handleSearch(e);
+    }
   };
 
   /* ------------------------------------------------------------------
@@ -369,7 +474,7 @@ const Dashboard = () => {
               }`}
             >
               {msg.role === 'assistant' && (
-                <div className="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center">
+                <div className="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center flex-shrink-0">
                   <Bot className="w-5 h-5 text-primary" />
                 </div>
               )}
@@ -381,14 +486,24 @@ const Dashboard = () => {
                     : 'bg-white/10 text-slate-200'
                 }`}
               >
-                {/* NORMAL TEXT */}
-                {msg.content && (
+                {/* NORMAL TEXT — render as Markdown for assistant messages */}
+                {msg.content && msg.role === 'assistant' && !msg.results && (
+                  <div className="prose prose-invert prose-sm max-w-none leading-relaxed">
+                    <ReactMarkdown>{msg.content}</ReactMarkdown>
+                    {msg.isStreaming && (
+                      <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-0.5 align-text-bottom" />
+                    )}
+                  </div>
+                )}
+
+                {/* USER TEXT */}
+                {msg.content && msg.role === 'user' && (
                   <p className="leading-relaxed whitespace-pre-wrap">
                     {msg.content}
                   </p>
                 )}
 
-                {/* 🔑 SEARCH RESULTS WITH VIEW SOURCE LINKS */}
+                {/* SEARCH RESULTS WITH VIEW SOURCE LINKS */}
                 {msg.results &&
                   msg.results.map((r, i) => {
                     return (
@@ -411,9 +526,7 @@ const Dashboard = () => {
                           </div>
                           {r.source?.source_file && (
                             <a
-                              href={`${API_URL}/document/view?file=${encodeURIComponent(
-                                r.source.source_file
-                              )}&start=${r.source.start_char || 0}&end=${r.source.end_char || 0}`}
+                              href={`${API_URL}/document/view?id=${r.id}`}
                               target="_blank"
                               rel="noopener noreferrer"
                               className="flex items-center gap-1 text-primary hover:underline"
@@ -429,7 +542,7 @@ const Dashboard = () => {
               </div>
 
               {msg.role === 'user' && (
-                <div className="w-8 h-8 rounded-full bg-secondary/20 flex items-center justify-center">
+                <div className="w-8 h-8 rounded-full bg-secondary/20 flex items-center justify-center flex-shrink-0">
                   <User className="w-5 h-5 text-secondary" />
                 </div>
               )}
@@ -438,25 +551,57 @@ const Dashboard = () => {
           <div ref={chatEndRef} />
         </div>
 
-        {/* INPUT */}
-        <form
-          onSubmit={handleSend}
-          className="p-4 border-t border-white/10 flex gap-2"
-        >
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask anything about your documents..."
-            className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white"
-          />
-          <button
-            type="submit"
-            disabled={isSearching}
-            className="bg-primary text-white px-4 rounded-xl"
+        {/* INPUT + MODE TOGGLE */}
+        <div className="border-t border-white/10">
+          {/* Mode Toggle */}
+          <div className="flex items-center gap-2 px-4 pt-3">
+            <button
+              onClick={() => setMode('ask')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                mode === 'ask'
+                  ? 'bg-primary text-white shadow-sm shadow-primary/30'
+                  : 'bg-white/5 text-slate-400 hover:text-slate-200 hover:bg-white/10'
+              }`}
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              Ask AI
+            </button>
+            <button
+              onClick={() => setMode('search')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                mode === 'search'
+                  ? 'bg-primary text-white shadow-sm shadow-primary/30'
+                  : 'bg-white/5 text-slate-400 hover:text-slate-200 hover:bg-white/10'
+              }`}
+            >
+              <Search className="w-3.5 h-3.5" />
+              Search
+            </button>
+            <span className="text-xs text-slate-500 ml-2">
+              {mode === 'ask' ? 'AI will answer using your documents' : 'Raw semantic search results'}
+            </span>
+          </div>
+
+          {/* Input */}
+          <form
+            onSubmit={handleSubmit}
+            className="p-4 flex gap-2"
           >
-            <Send className="w-4 h-4" />
-          </button>
-        </form>
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={mode === 'ask' ? "Ask anything about your documents..." : "Search your documents..."}
+              className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white"
+            />
+            <button
+              type="submit"
+              disabled={isSearching}
+              className="bg-primary text-white px-4 rounded-xl disabled:opacity-50"
+            >
+              <Send className="w-4 h-4" />
+            </button>
+          </form>
+        </div>
       </main>
     </div>
   );
