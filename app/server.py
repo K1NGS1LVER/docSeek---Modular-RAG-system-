@@ -683,10 +683,10 @@ def _github_ingest_worker(repo_url: str, subpath: Optional[str]):
         logger.info(f"Cloning {repo_url} into {tmpdir}")
 
         result = subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, tmpdir],
+            ["git", "clone", "--depth", "1", "--filter=blob:none", repo_url, tmpdir],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=600,
         )
         if result.returncode != 0:
             raise Exception(f"Git clone failed: {result.stderr.strip()}")
@@ -827,22 +827,25 @@ def ingest_github(request: GitHubIngestRequest):
 
 @app.get("/documents")
 def list_documents():
-    """Return list of uploaded document filenames"""
+    """Return list of uploaded documents with chunk counts"""
     all_metadata = database.get_all_metadata()
-    files = set()
+    file_chunks = {}
 
     for m in all_metadata:
         if not m:
             continue
         try:
             meta_obj = json.loads(m)
-            if "filename" in meta_obj:
-                files.add(meta_obj["filename"])
+            filename = meta_obj.get("filename")
+            if filename:
+                file_chunks[filename] = file_chunks.get(filename, 0) + 1
         except Exception:
-            # Legacy format - just extract filename if it's part of metadata
             pass
 
-    return list(files)
+    return [
+        {"name": name, "chunks": count, "status": "indexed"}
+        for name, count in file_chunks.items()
+    ]
 
 
 @app.get("/ingest/status")

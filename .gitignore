@@ -14,7 +14,9 @@ data/
 *.faiss
 *.log
 *.sqlite
+MODULE_FLOWS.md
 
 # OS specific
 .DS_Store
 .tissues
+

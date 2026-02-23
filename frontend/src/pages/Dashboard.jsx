@@ -80,7 +80,7 @@ const Dashboard = () => {
             const res = await fetch(`${API_URL}/ingest/github`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url: githubUrl, subpath: githubSubpath })
+                body: JSON.stringify({ repo_url: githubUrl, subpath: githubSubpath })
             });
             
             if (res.ok) {
@@ -238,11 +238,21 @@ const Dashboard = () => {
                             {ingestStatus.total > 0 && <span>{Math.round((ingestStatus.progress / ingestStatus.total) * 100)}%</span>}
                         </div>
                         <div className="h-1.5 bg-blue-500/20 rounded-full overflow-hidden">
-                            <motion.div 
-                                className="h-full bg-blue-500" 
-                                initial={{ width: 0 }}
-                                animate={{ width: `${ingestStatus.total > 0 ? (ingestStatus.progress / ingestStatus.total) * 100 : 0}%` }}
-                            />
+                            {ingestStatus.total > 0 ? (
+                                <motion.div 
+                                    className="h-full bg-blue-500" 
+                                    initial={{ width: 0 }}
+                                    animate={{ width: `${(ingestStatus.progress / ingestStatus.total) * 100}%` }}
+                                />
+                            ) : (
+                                <motion.div 
+                                    className="h-full bg-blue-500 rounded-full" 
+                                    style={{ width: '30%' }}
+                                    initial={{ x: '-100%' }}
+                                    animate={{ x: '400%' }}
+                                    transition={{ repeat: Infinity, duration: 1.2, ease: 'easeInOut' }}
+                                />
+                            )}
                         </div>
                     </div>
                 )}
