@@ -1,63 +1,38 @@
-import { Link, useLocation } from 'react-router-dom';
-import { motion } from 'framer-motion';
-import { Zap, Github, ArrowRight } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Sparkles, Github } from 'lucide-react';
 
 const Navbar = () => {
-  const location = useLocation();
-  const isDashboard = location.pathname === '/dashboard';
+    return (
+        <nav className="sticky top-0 z-50 backdrop-blur-lg border-b border-white/10 bg-dark/50">
+            <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+                <Link to="/" className="flex items-center space-x-2 group">
+                    <div className="p-2 bg-gradient-to-tr from-primary to-secondary rounded-lg group-hover:scale-105 transition-transform duration-300">
+                        <Sparkles className="w-5 h-5 text-white" />
+                    </div>
+                    <span className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-white/60">
+                        docSeek
+                    </span>
+                </Link>
 
-  return (
-    <motion.nav
-      initial={{ y: -20, opacity: 0 }}
-      animate={{ y: 0, opacity: 1 }}
-      transition={{ duration: 0.5 }}
-      className="fixed top-0 left-0 right-0 z-50 border-b border-white/5 bg-dark/80 backdrop-blur-xl"
-    >
-      <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-        {/* Logo */}
-        <Link to="/" className="flex items-center gap-2.5 group">
-          <div className="w-8 h-8 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center group-hover:bg-accent/20 transition-all duration-300">
-            <Zap className="w-4 h-4 text-accent" />
-          </div>
-          <span className="font-display font-bold text-lg tracking-tight">
-            Doc<span className="text-accent">Seek</span>
-          </span>
-        </Link>
-
-        {/* Nav Links */}
-        <div className="flex items-center gap-6">
-          <a
-            href="https://github.com/K1NGS1LVER/docSeek---Modular-RAG-system-"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-white/40 hover:text-white/80 transition-colors duration-200"
-          >
-            <Github className="w-5 h-5" />
-          </a>
-
-          {isDashboard ? (
-            <Link
-              to="/"
-              className="text-sm text-white/50 hover:text-white transition-colors duration-200"
-            >
-              Home
-            </Link>
-          ) : (
-            <Link to="/dashboard">
-              <motion.button
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
-                className="flex items-center gap-2 px-5 py-2 bg-accent text-black font-semibold text-sm rounded-lg hover:bg-accent/90 transition-colors duration-200"
-              >
-                Launch App
-                <ArrowRight className="w-4 h-4" />
-              </motion.button>
-            </Link>
-          )}
-        </div>
-      </div>
-    </motion.nav>
-  );
+                <div className="flex items-center space-x-6">
+                    <a
+                        href="https://github.com/K1NGS1LVER/docSeek---Modular-RAG-system-"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-white hover:text-primary transition-colors duration-200"
+                    >
+                        <Github className="w-6 h-6" />
+                    </a>
+                    <Link
+                        to="/dashboard"
+                        className="px-6 py-2.5 bg-primary hover:bg-primary/90 text-white font-medium rounded-full shadow-lg hover:shadow-primary/25 transition-all duration-200"
+                    >
+                        Launch App
+                    </Link>
+                </div>
+            </div>
+        </nav>
+    );
 };
 
 export default Navbar;
