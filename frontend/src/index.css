@@ -1,0 +1,139 @@
+@import "tailwindcss";
+
+@theme {
+  --bg-main: #14171c;
+  --bg-panel: #1d2229;
+  --bg-sidebar: #15191f;
+  --border-subtle: #2a3038;
+  --text-primary: #d9dde5;
+  --text-secondary: #b0b6c4;
+  --accent-primary: #f26a1b;
+
+  --color-carbon: var(--bg-panel);
+  --color-panel: #212730;
+  --color-surface: #242b34;
+  --color-border: var(--border-subtle);
+  --color-border-bright: #3a4250;
+  --color-accent: var(--accent-primary);
+  --color-accent-dim: #d85f17;
+  --color-caution: #e25555;
+  --color-success: #2bb673;
+  --color-info: #4e8ef7;
+  --color-text: var(--text-primary);
+  --color-text-dim: var(--text-secondary);
+  --color-text-muted: #8891a3;
+
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-display: 'Space Grotesk', 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; font-size: 17px; }
+
+body {
+  background: var(--bg-main);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+  height: 100vh;
+}
+
+#root { height: 100vh; overflow: hidden; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #39404b; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #4a5362; }
+
+::selection { background: rgba(242, 106, 27, 0.22); color: #f3f4f6; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+.animate-pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+
+.telemetry-grid { background-image: none; }
+
+/* Layout refinements */
+.w-52 { width: 240px; }
+aside.w-52 { background: var(--bg-sidebar); }
+
+/* Sidebar readability: slightly larger nav text for comfortable scanning */
+aside.w-52 nav a {
+  font-size: 15px;
+  line-height: 1.3;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+aside.w-52 nav a svg { width: 16px; height: 16px; }
+aside.w-52 nav .text-[9px] {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--color-text-muted);
+}
+
+/* App shell: remove the visual gap created by the inline margin and let main fill the viewport */
+main.bg-carbon {
+  position: relative;
+  left: -200px;
+  width: calc(100% + 200px);
+  background: var(--bg-main);
+}
+
+/* Neutralize bright utility colors to match the theme */
+.bg-white\/5,
+.bg-white\/10 { background-color: var(--bg-panel) !important; }
+.border-white\/10,
+.border-white\/20 { border-color: var(--border-subtle) !important; }
+.bg-dark\/80 { background-color: rgba(20, 23, 28, 0.92) !important; }
+.backdrop-blur-xl { backdrop-filter: none !important; }
+.bg-accent\/5 { background-color: rgba(242, 106, 27, 0.08) !important; }
+
+/* Card depth and separation */
+.bg-panel,
+.bg-carbon {
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.35);
+}
+.space-y-px > .bg-carbon {
+  border-left: 2px solid rgba(242, 106, 27, 0.35);
+  background-color: var(--color-panel);
+}
+
+/* Typography hierarchy and readability */
+h1, h2, h3 { color: var(--text-primary); }
+p { line-height: 1.6; }
+.text-text-muted { color: var(--color-text-muted); }
+.text-text-dim { color: var(--color-text-dim); }
+
+/* Retrieval chunk readability */
+.space-y-px > .bg-carbon p {
+  color: var(--text-secondary);
+}
+
+/* Query surface: make the primary workflow visually dominant */
+.flex.flex-col.h-full > .flex-1.overflow-y-auto {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  padding: 28px 32px;
+  margin: 18px 22px;
+  border-radius: 6px;
+}
+.flex.flex-col.h-full > .border-t.border-border.p-4.bg-panel {
+  padding: 16px 24px;
+  border-top-color: var(--border-subtle);
+}
+.flex.flex-col.h-full .space-y-px > :not([hidden]) ~ :not([hidden]) {
+  margin-top: 12px;
+}
+
+/* Match highlights */
+mark {
+  background: rgba(242, 106, 27, 0.18);
+  color: var(--text-primary);
+  padding: 0 2px;
+  border-radius: 2px;
+}

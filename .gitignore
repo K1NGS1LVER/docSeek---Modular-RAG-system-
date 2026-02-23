@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Data & Persistence
+data/
+*.db
+*.faiss
+*.log
+*.sqlite
+
+# OS specific
+.DS_Store
+.tissues
